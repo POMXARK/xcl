@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "bcpack-gpu-sdk"
-version = "0.14.1"
-source = "git+https://github.com/POMXARK/bcpack-gpu-sdk.git?tag=v0.14.1#727a214b5d68a23dc5e1df7f5efd00089ab42d39"
+version = "0.15.1"
+source = "git+https://github.com/POMXARK/bcpack-gpu-sdk.git?tag=v0.15.1#96b7e7573e048f50b69b71afd7508130d8b4ff3d"
 dependencies = [
  "bcpack-rs",
  "windows 0.58.0",

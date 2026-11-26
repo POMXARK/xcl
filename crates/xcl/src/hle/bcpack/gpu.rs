@@ -4,7 +4,7 @@
 //! with `XCL_GPU_BCPACK=1` (off by default). Uploads `xcl`'s built-in
 //! `tables.rs` tables at worker startup via runtime C-ABI setters, routes
 //! `BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, and `BC7` (Modes 0-7) to GPU Async
-//! Compute (`bcpack-gpu-sdk v0.14.1`), and coalesces concurrent worker jobs
+//! Compute (`bcpack-gpu-sdk v0.15.1`), and coalesces concurrent worker jobs
 //! via `BcPackDecodeBatch`. Chunks smaller than `XCL_GPU_BCPACK_MIN_KB`
 //! (default `32` KiB) or unsupported/invalid sizes fall back transparently to
 //! `hle::bcpack::victory::decode`.
@@ -97,69 +97,82 @@ impl FfiDecoder {
     }
 
     fn decode_batch(&mut self, jobs: &[Job]) -> Vec<Result<Vec<u8>, &'static str>> {
-        let mut out_bufs: Vec<Vec<u8>> = Vec::with_capacity(jobs.len());
-        let mut items: Vec<BcPackBatchItem> = Vec::with_capacity(jobs.len());
-
-        for job in jobs {
-            let valid = bc_format_layout(job.bc).filter(|&(_, blk_bytes)| {
-                job.out_len > 0 && job.out_len % blk_bytes == 0 && !job.src.is_empty()
-            });
-            if let Some((fmt, blk_bytes)) = valid {
-                let mut buf = vec![0u8; job.out_len];
-                let out_ptr = buf.as_mut_ptr();
-                items.push(BcPackBatchItem {
-                    compressed_data: job.src.as_ptr(),
-                    compressed_size: job.src.len() as u32,
-                    num_blocks: (job.out_len / blk_bytes) as u32,
-                    format: fmt,
-                    swizzle_mode: BCPACK_SWIZZLE_LINEAR,
-                    width_blocks: 0,
-                    height_blocks: 0,
-                    out_host_buffer: out_ptr,
-                    out_capacity: job.out_len as u32,
-                    status: 0,
-                });
-                out_bufs.push(buf);
-            } else {
-                items.push(BcPackBatchItem {
-                    compressed_data: std::ptr::null(),
-                    compressed_size: 0,
-                    num_blocks: 0,
-                    format: BCPACK_FORMAT_BC1,
-                    swizzle_mode: BCPACK_SWIZZLE_LINEAR,
-                    width_blocks: 0,
-                    height_blocks: 0,
-                    out_host_buffer: std::ptr::null_mut(),
-                    out_capacity: 0,
-                    status: -1,
-                });
-                out_bufs.push(Vec::new());
+        let ctx = self.0;
+        decode_batch_with(jobs, |items| {
+            let mut kernel_ms = 0.0f64;
+            // SAFETY: `ctx` is live for `&mut self`; valid items point into `job.src` and exclusive `out_bufs` entries.
+            unsafe {
+                BcPackDecodeBatch(
+                    ctx,
+                    items.as_mut_ptr(),
+                    items.len() as u32,
+                    &mut kernel_ms,
+                )
             }
-        }
-
-        let mut kernel_ms = 0.0f64;
-        // SAFETY: `self.0` is live for `&mut self`; valid items point into `job.src` and exclusive `out_bufs` entries.
-        let _ok_count = unsafe {
-            BcPackDecodeBatch(
-                self.0,
-                items.as_mut_ptr(),
-                items.len() as u32,
-                &mut kernel_ms,
-            )
-        };
-
-        out_bufs
-            .into_iter()
-            .zip(items)
-            .map(|(buf, item)| {
-                if item.status == 0 {
-                    Ok(buf)
-                } else {
-                    Err("GPU BCPack batch decode error")
-                }
-            })
-            .collect()
+        })
     }
+}
+
+fn decode_batch_with<F>(jobs: &[Job], mut invoke: F) -> Vec<Result<Vec<u8>, &'static str>>
+where
+    F: FnMut(&mut [BcPackBatchItem]) -> i32,
+{
+    let mut out_bufs: Vec<Vec<u8>> = Vec::with_capacity(jobs.len());
+    let mut items: Vec<BcPackBatchItem> = Vec::with_capacity(jobs.len());
+
+    for job in jobs {
+        let valid = bc_format_layout(job.bc).filter(|&(_, blk_bytes)| {
+            job.out_len > 0 && job.out_len % blk_bytes == 0 && !job.src.is_empty()
+        });
+        if let Some((fmt, blk_bytes)) = valid {
+            let mut buf = vec![0u8; job.out_len];
+            let out_ptr = buf.as_mut_ptr();
+            items.push(BcPackBatchItem {
+                compressed_data: job.src.as_ptr(),
+                compressed_size: job.src.len() as u32,
+                num_blocks: (job.out_len / blk_bytes) as u32,
+                format: fmt,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 0,
+                height_blocks: 0,
+                out_host_buffer: out_ptr,
+                out_capacity: job.out_len as u32,
+                status: -1,
+            });
+            out_bufs.push(buf);
+        } else {
+            items.push(BcPackBatchItem {
+                compressed_data: std::ptr::null(),
+                compressed_size: 0,
+                num_blocks: 0,
+                format: BCPACK_FORMAT_BC1,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 0,
+                height_blocks: 0,
+                out_host_buffer: std::ptr::null_mut(),
+                out_capacity: 0,
+                status: -1,
+            });
+            out_bufs.push(Vec::new());
+        }
+    }
+
+    let rc = invoke(&mut items);
+    if rc < 0 {
+        return vec![Err("GPU BCPack batch decode error"); jobs.len()];
+    }
+
+    out_bufs
+        .into_iter()
+        .zip(items)
+        .map(|(buf, item)| {
+            if item.status == 0 {
+                Ok(buf)
+            } else {
+                Err("GPU BCPack batch decode error")
+            }
+        })
+        .collect()
 }
 
 impl Drop for FfiDecoder {
@@ -200,16 +213,17 @@ fn worker_loop(rx: Receiver<Job>) {
     }
 }
 
-fn sender() -> &'static Sender<Job> {
-    static TX: OnceLock<Sender<Job>> = OnceLock::new();
+fn sender() -> Option<&'static Sender<Job>> {
+    static TX: OnceLock<Option<Sender<Job>>> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("xcl-gpu-bcpack".into())
             .spawn(move || worker_loop(rx))
-            .expect("spawn xcl-gpu-bcpack thread");
-        tx
+            .ok()
+            .map(|_| tx)
     })
+    .as_ref()
 }
 
 fn enabled() -> bool {
@@ -300,7 +314,13 @@ pub(super) fn try_decode(mode: u8, src: &[u8], out_len: usize) -> Option<Result<
     submit_gpu_worker(mode, src, out_len)
 }
 
-fn submit_gpu_worker(mode: u8, src: &[u8], out_len: usize) -> Option<Result<Vec<u8>, &'static str>> {
+fn submit_with_sender(
+    tx: Option<&Sender<Job>>,
+    mode: u8,
+    src: &[u8],
+    out_len: usize,
+) -> Option<Result<Vec<u8>, &'static str>> {
+    let tx = tx?;
     let blk = super::block_size(mode)?;
     if out_len == 0
         || out_len % blk != 0
@@ -316,13 +336,17 @@ fn submit_gpu_worker(mode: u8, src: &[u8], out_len: usize) -> Option<Result<Vec<
         out_len,
         reply: reply_tx,
     };
-    if sender().send(job).is_err() {
+    if tx.send(job).is_err() {
         return None;
     }
     match reply_rx.recv() {
         Ok(Ok(out)) => Some(Ok(out)),
         Ok(Err(_)) | Err(_) => None,
     }
+}
+
+fn submit_gpu_worker(mode: u8, src: &[u8], out_len: usize) -> Option<Result<Vec<u8>, &'static str>> {
+    submit_with_sender(sender(), mode, src, out_len)
 }
 
 #[cfg(test)]
@@ -444,5 +468,107 @@ mod tests {
             assert_eq!(&gpu_out, cpu_out, "batch mismatch for {stem}");
         }
         println!("[xcl-gpu-bcpack] batch decoded {valid_n} valid vectors (+1 isolated err): 0 byte mismatches");
+    }
+
+    fn first_valid_vector() -> (u8, Vec<u8>, Vec<u8>) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/bcpack");
+        let mut bins: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bin"))
+            .collect();
+        bins.sort();
+        for path in bins {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let parts: Vec<&str> = stem.split('-').collect();
+            let mode: u8 = parts[0].strip_prefix("bc").unwrap().parse().unwrap();
+            let units: usize = parts[1].parse().unwrap();
+            let out_len = units * 8;
+            let src = std::fs::read(&path).unwrap();
+            let mut cpu_out = vec![0u8; out_len];
+            if victory::decode(mode, &src, &mut cpu_out, victory::Tables::builtin()).is_ok() {
+                return (mode, src, cpu_out);
+            }
+        }
+        panic!("expected at least one valid bcpack test vector");
+    }
+
+    #[test]
+    fn batch_early_error_return_rejects_items_and_falls_back_to_cpu() {
+        let (mode, src, cpu_expected) = first_valid_vector();
+        let src_snapshot = src.clone();
+        let out_len = cpu_expected.len();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let jobs = [Job {
+            bc: mode,
+            src: src.clone(),
+            out_len,
+            reply: tx,
+        }];
+
+        let early_err_results = decode_batch_with(&jobs, |items| {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].status, -1, "batch item must default to failure sentinel");
+            -99
+        });
+        assert_eq!(early_err_results.len(), 1);
+        assert!(early_err_results[0].is_err());
+
+        let tampered_status_results = decode_batch_with(&jobs, |items| {
+            items[0].status = 0;
+            -99
+        });
+        assert_eq!(tampered_status_results.len(), 1);
+        assert!(
+            tampered_status_results[0].is_err(),
+            "negative batch return code must fail even if an item reports status 0"
+        );
+
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let recv_handle = std::thread::spawn(move || {
+            let job = worker_rx.recv().unwrap();
+            let res = decode_batch_with(&[job], |_| -99).pop().unwrap();
+            let _ = reply_tx.send(res);
+        });
+        let worker_job = Job {
+            bc: mode,
+            src: src.clone(),
+            out_len,
+            reply: mpsc::sync_channel(1).0,
+        };
+        worker_tx.send(worker_job).unwrap();
+        drop(worker_tx);
+        recv_handle.join().unwrap();
+        let gpu_outcome: Option<Result<Vec<u8>, &'static str>> = match reply_rx.recv() {
+            Ok(Ok(out)) => Some(Ok(out)),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        assert!(gpu_outcome.is_none());
+        assert_eq!(src, src_snapshot);
+
+        let mut cpu_fallback = vec![0u8; out_len];
+        victory::decode(mode, &src, &mut cpu_fallback, victory::Tables::builtin())
+            .expect("CPU fallback decode must succeed after GPU batch failure");
+        assert_eq!(cpu_fallback, cpu_expected);
+    }
+
+    #[test]
+    fn unavailable_worker_falls_back_to_cpu_without_panicking() {
+        let (mode, src, cpu_expected) = first_valid_vector();
+        let src_snapshot = src.clone();
+        let out_len = cpu_expected.len();
+
+        assert!(submit_with_sender(None, mode, &src, out_len).is_none());
+
+        let (dead_tx, dead_rx) = mpsc::channel();
+        drop(dead_rx);
+        assert!(submit_with_sender(Some(&dead_tx), mode, &src, out_len).is_none());
+
+        assert_eq!(src, src_snapshot);
+        let mut cpu_fallback = vec![0u8; out_len];
+        victory::decode(mode, &src, &mut cpu_fallback, victory::Tables::builtin())
+            .expect("CPU fallback decode must succeed when worker is unavailable");
+        assert_eq!(cpu_fallback, cpu_expected);
     }
 }
