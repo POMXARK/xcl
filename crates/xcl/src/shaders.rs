@@ -1247,6 +1247,17 @@ mod pipeline_cap_tests {
     }
 
     #[test]
+    fn default_pipeline_threads_scales_within_bounds() {
+        use super::default_pipeline_threads;
+        assert_eq!(default_pipeline_threads(4, 8), 2);
+        assert_eq!(default_pipeline_threads(8, 16), 4);
+        assert_eq!(default_pipeline_threads(16, 16), 4);
+        assert_eq!(default_pipeline_threads(16, 32), 8);
+        assert_eq!(default_pipeline_threads(24, 64), 12);
+        assert_eq!(default_pipeline_threads(64, 128), 12);
+    }
+
+    #[test]
     fn stale_blob_cannot_bypass_the_offline_pipeline_cap() {
         use super::{Pipelines, recomp, Ordering};
         use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1413,6 +1424,28 @@ mod pipeline_cap_tests {
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
+fn system_ram_gb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+        m.ullTotalPhys >> 30
+    } else {
+        16
+    }
+}
+
+fn default_pipeline_threads(logical_cores: usize, total_ram_gb: u64) -> usize {
+    let by_cores = (logical_cores / 2).clamp(2, 12);
+    let by_ram = match total_ram_gb {
+        0..=12 => 2,
+        13..=20 => 4,
+        21..=40 => 8,
+        _ => 12,
+    };
+    by_cores.min(by_ram).max(1)
+}
+
 impl Pipelines {
     fn new() -> Result<Pipelines, String> { Self::for_adapter("auto") }
 
@@ -1429,7 +1462,16 @@ impl Pipelines {
                 let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
                 crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
             };
-            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+            let most = std::env::var("XCL_PIPELINE_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    default_pipeline_threads(
+                        std::thread::available_parallelism().map_or(4, |n| n.get()),
+                        system_ram_gb(),
+                    )
+                })
+                .max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
                 dev,
