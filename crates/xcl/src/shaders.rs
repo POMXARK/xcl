@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -1726,13 +1726,24 @@ fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
     out
 }
 
-fn save_precompile_index(path: &Path, map: &HashMap<u64, Vec<u64>>) -> std::io::Result<()> {
+fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let _lock = recomp::dxc::lock_cache_file_timeout(path, 250).map_err(std::io::Error::other)?;
+    let mut map = load_precompile_index(path);
+    for (&rec_hash, keys) in additions {
+        if !keys.is_empty() && keys.len() <= 256 {
+            map.insert(rec_hash, keys.clone());
+        }
+    }
     let mut buf = Vec::with_capacity(8 + map.len() * 20);
     buf.extend_from_slice(PRECOMPILE_INDEX_MAGIC);
-    for (&rec_hash, keys) in map {
+    for (&rec_hash, keys) in &map {
         if keys.is_empty() || keys.len() > 256 {
             continue;
         }
@@ -1742,14 +1753,16 @@ fn save_precompile_index(path: &Path, map: &HashMap<u64, Vec<u64>>) -> std::io::
             buf.extend_from_slice(&k.to_le_bytes());
         }
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
     std::fs::write(&tmp, &buf)?;
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    let to_wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+    let tmp_w = to_wide(&tmp);
+    let dst_w = to_wide(path);
+    if unsafe { MoveFileExW(tmp_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) } == 0 {
+        let err = std::io::Error::last_os_error();
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(err);
     }
     Ok(())
 }
@@ -1823,7 +1836,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     } else {
         HashSet::new()
     };
-    let index_state: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(initial_index.clone());
+    let index_state: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(HashMap::new());
     let dirty_index = AtomicUsize::new(0);
     let seen_programs: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(HashMap::new());
     let seen_hlsl_jobs: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
@@ -2574,11 +2587,20 @@ mod tests {
         let loaded = load_precompile_index(&idx);
         assert_eq!(loaded, map);
 
+        // Saving disjoint additions merges with existing on-disk index entries
+        let mut extra = HashMap::new();
+        extra.insert(0x9999_0000_1111_2222u64, vec![0xEEEEu64]);
+        save_precompile_index(&idx, &extra).unwrap();
+        let merged = load_precompile_index(&idx);
+        assert_eq!(merged.get(&0x1111_2222_3333_4444u64), map.get(&0x1111_2222_3333_4444u64));
+        assert_eq!(merged.get(&0x5555_6666_7777_8888u64), map.get(&0x5555_6666_7777_8888u64));
+        assert_eq!(merged.get(&0x9999_0000_1111_2222u64), extra.get(&0x9999_0000_1111_2222u64));
+
         // Corrupt trailing bytes stop safely without discarding valid prefix entries
         let mut raw = std::fs::read(&idx).unwrap();
         raw.extend_from_slice(&[0xFFu8; 7]);
         std::fs::write(&idx, raw).unwrap();
-        assert_eq!(load_precompile_index(&idx), map);
+        assert_eq!(load_precompile_index(&idx), merged);
 
         // Scope hash changes cleanly when translator source, direct_gfx, or safe_barrier toggles
         assert_ne!(

@@ -434,3 +434,52 @@ fn shaders_precompile_scopes_safe_barrier_and_bypasses_diagnostic_overrides() {
     assert!(diag_stdout.contains("errors 0"), "{diag_stdout}");
     assert_eq!(count_indices(cache_dir.path()), 2);
 }
+
+#[test]
+fn shaders_precompile_concurrent_processes_preserve_both_index_entries() {
+    /// s_mov_b32 s0, s1 ; v_add_f32 v0, v2, v5 ; s_endpgm
+    const CODE_B: [u8; 12] = [0x01, 0x03, 0x80, 0xbe, 0x02, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+    let dir_a = TempDir::new("concurrent-a");
+    let dir_b = TempDir::new("concurrent-b");
+    std::fs::write(dir_a.path().join("ps_a.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    std::fs::write(dir_b.path().join("ps_b.bin"), xbox_shader(0, &[fssm(&CODE_B, &[(5, 1)])])).unwrap();
+
+    for trial in 0..3 {
+        let cache_dir = TempDir::new(&format!("concurrent-cache-{trial}"));
+        let child_a = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(dir_a.path())
+            .arg("--precompile")
+            .env("XCL_DXIL_CACHE", cache_dir.path())
+            .env_remove("XCL_DIRECT_DXIL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child a");
+        let child_b = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(dir_b.path())
+            .arg("--precompile")
+            .env("XCL_DXIL_CACHE", cache_dir.path())
+            .env_remove("XCL_DIRECT_DXIL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child b");
+
+        let out_a = child_a.wait_with_output().unwrap();
+        let out_b = child_b.wait_with_output().unwrap();
+        assert!(out_a.status.success(), "trial {trial} A: {out_a:?}");
+        assert!(out_b.status.success(), "trial {trial} B: {out_b:?}");
+
+        let warm_a = run_shaders_with_cache(dir_a.path(), &["--precompile"], cache_dir.path());
+        assert!(warm_a.status.success(), "trial {trial} warm_a: {warm_a:?}");
+        let stdout_a = String::from_utf8(warm_a.stdout).unwrap();
+        assert!(stdout_a.contains("compiled 0, already cached 1, errors 0"), "trial {trial} A: {stdout_a}");
+
+        let warm_b = run_shaders_with_cache(dir_b.path(), &["--precompile"], cache_dir.path());
+        assert!(warm_b.status.success(), "trial {trial} warm_b: {warm_b:?}");
+        let stdout_b = String::from_utf8(warm_b.stdout).unwrap();
+        assert!(stdout_b.contains("compiled 0, already cached 1, errors 0"), "trial {trial} B: {stdout_b}");
+    }
+}

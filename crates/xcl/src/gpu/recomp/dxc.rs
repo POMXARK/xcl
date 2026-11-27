@@ -827,7 +827,7 @@ fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
     flight
 }
 
-struct ProcessCacheLock {
+pub(crate) struct ProcessCacheLock {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
@@ -877,20 +877,28 @@ fn normalized_cache_dir(dir: &Path) -> PathBuf {
     absolute
 }
 
-fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+pub(crate) fn lock_cache_file_timeout(file: &Path, timeout_ms: u32) -> Result<ProcessCacheLock, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
     let name = crate::util::wide(&cache_mutex_name(file));
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err("DXIL cache: cannot create the cross-process mutex".into());
     }
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if wait == WAIT_TIMEOUT {
+        unsafe { CloseHandle(handle) };
+        return Err("DXIL cache: cross-process lock timed out".into());
+    }
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         unsafe { CloseHandle(handle) };
         return Err(format!("DXIL cache: waiting for the cross-process mutex failed ({wait:#x})"));
     }
     Ok(ProcessCacheLock { handle })
+}
+
+fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
+    lock_cache_file_timeout(file, windows_sys::Win32::System::Threading::INFINITE)
 }
 
 fn cached_file(file: &Path) -> Option<Vec<u8>> {
