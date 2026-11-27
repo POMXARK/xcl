@@ -1915,11 +1915,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
         let p = pipelines.expect("startup requested pipelines");
         let refused = p.refused.load(Ordering::Relaxed);
-        let capped = p.capped.load(Ordering::Relaxed);
-        if failed + refused + capped > 0 {
-            let cause = errors.first().map(String::as_str).unwrap_or(
-                if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
-                else { "Check the shader pack and driver diagnostics." });
+        if failed + refused > 0 {
+            let capped = p.capped.load(Ordering::Relaxed);
+            let cause = errors.first().map(String::as_str).unwrap_or("Check the shader pack and driver diagnostics.");
             return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
         }
     }
