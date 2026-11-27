@@ -1694,6 +1694,10 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
+fn is_incomplete_translation_error(err: &str) -> bool {
+    err.starts_with("incomplete translation")
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
@@ -1792,48 +1796,67 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 }
                 // A mesh-mode (NGG) program: route through `pso::console_mesh_in` so
                 // `XCL_DIRECT_DXIL` and `translated/v2` caching match runtime pipeline creation.
+                // Incomplete translations fall back to the per-program loop below so incomplete
+                // programs/variants are skipped cleanly while any supported variants still compile.
+                let mut mesh_incomplete = false;
                 if sh.fssm.iter().any(|f| f.stages.first().is_some_and(|s| s.hw == 7) && matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Mesh(_)))) {
                     match recomp::pso::console_mesh_in(&blob, None, split, windows) {
-                        Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                        Ok(_) => {
+                            compiled.fetch_add(1, Ordering::Relaxed);
+                            record_done();
+                            continue;
+                        }
+                        Err(e) if is_incomplete_translation_error(&e) => {
+                            mesh_incomplete = true;
+                        }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
                             }
-                            failed.fetch_add(1, Ordering::Relaxed)
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            record_done();
+                            continue;
                         }
                     };
-                    record_done();
-                    continue;
                 }
-                if crate::gpu::dxil::kernel::enabled_graphics() {
+                let mut fallback_fssms = Vec::new();
+                if !mesh_incomplete && crate::gpu::dxil::kernel::enabled_graphics() {
                     for f in &sh.fssm {
                         let hw = f.stages.first().map(|s| s.hw);
-                        let stage = match (recomp::interface(&blob, &sh, f), hw) {
-                            (Some(recomp::Mode::Vertex(_)), Some(4)) => recomp::pso::Stage::Vertex,
-                            (Some(recomp::Mode::Pixel(_)), Some(5)) => recomp::pso::Stage::Pixel,
-                            (Some(_), _) => {
+                        let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                        let stage = match (&mode, hw) {
+                            (recomp::Mode::Vertex(_), Some(4)) => recomp::pso::Stage::Vertex,
+                            (recomp::Mode::Pixel(_), Some(5)) => recomp::pso::Stage::Pixel,
+                            _ => {
                                 skipped.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            (None, _) => continue,
                         };
                         match recomp::pso::console_to_dxil_in(&blob, stage, 0, graphics_split, windows) {
-                            Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                            Ok(_) => {
+                                compiled.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) if is_incomplete_translation_error(&e) => {
+                                fallback_fssms.push((f, mode));
+                            }
                             Err(e) => {
                                 let mut g = errors.lock().unwrap();
                                 if g.len() < 10 {
                                     g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
                                 }
-                                failed.fetch_add(1, Ordering::Relaxed)
+                                failed.fetch_add(1, Ordering::Relaxed);
                             }
                         };
                     }
-                    record_done();
-                    continue;
+                } else {
+                    for f in &sh.fssm {
+                        if let Some(mode) = recomp::interface(&blob, &sh, f) {
+                            fallback_fssms.push((f, mode));
+                        }
+                    }
                 }
-                for f in &sh.fssm {
-                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                for (f, mode) in fallback_fssms {
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
@@ -2410,6 +2433,42 @@ mod tests {
         assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
+    }
+
+    #[test]
+    fn startup_preparation_skips_incomplete_and_fails_on_decode_error() {
+        /// s_incperflevel 0 ; v_add_f32 v0, v1, v5 ; s_endpgm
+        const INCOMPLETE_CODE: [u8; 12] = [0x00, 0x00, 0x94, 0xBF, 0x01, 0x0B, 0x00, 0x06, 0x00, 0x00, 0x81, 0xBF];
+        /// undecodable 0xffffffff ; s_endpgm
+        const INVALID_CODE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x81, 0xBF];
+
+        assert!(is_incomplete_translation_error("incomplete translation, missing: [\"s_round_mode\"]"));
+        assert!(!is_incomplete_translation_error("cannot decode dword 0xffffffff"));
+
+        if let Err(e) = Pipelines::for_adapter("auto") {
+            recomp::runner::skip_test(&e);
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("xcl-prep-incomplete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let loose = dir.join("shaders");
+        std::fs::create_dir_all(&loose).unwrap();
+
+        let ps_incomplete = sample(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)])]);
+        let ps_mixed = sample(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)]), fssm(&CODE, &[(5, 1)])]);
+        std::fs::write(loose.join("00_incomplete.dxbc"), &ps_incomplete).unwrap();
+        std::fs::write(loose.join("01_mixed.dxbc"), &ps_mixed).unwrap();
+
+        let progress = LaunchPreparation::default();
+        prepare_for_launch(&dir, &progress).expect("incomplete loose PS and mixed container must not fail startup preparation");
+
+        let ps_invalid = sample(0, &[fssm(&INVALID_CODE, &[(5, 1)])]);
+        std::fs::write(loose.join("02_invalid.dxbc"), &ps_invalid).unwrap();
+        let err = prepare_for_launch(&dir, &LaunchPreparation::default()).unwrap_err();
+        assert!(err.contains("record failures"), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
