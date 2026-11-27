@@ -472,6 +472,30 @@ fn shaders_precompile_concurrent_processes_preserve_both_index_entries() {
         assert!(out_a.status.success(), "trial {trial} A: {out_a:?}");
         assert!(out_b.status.success(), "trial {trial} B: {out_b:?}");
 
+        // Verify directly from disk BEFORE any serial revisit that both records survived in the index.
+        let indices: Vec<PathBuf> = std::fs::read_dir(cache_dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let s = e.file_name().to_string_lossy().into_owned();
+                (s.starts_with("precompile-index-v1-") && s.ends_with(".bin")).then(|| e.path())
+            })
+            .collect();
+        assert_eq!(indices.len(), 1, "trial {trial}: expected 1 shared index, got {indices:?}");
+        let raw = std::fs::read(&indices[0]).unwrap();
+        let mut rest = raw.strip_prefix(b"XCLPIDX1").expect("valid index magic");
+        let mut entry_hashes = Vec::new();
+        while rest.len() >= 12 {
+            let rec_hash = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let count = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+            let need = 12 + count * 8;
+            assert!(rest.len() >= need, "trial {trial}: truncated index entry");
+            entry_hashes.push(rec_hash);
+            rest = &rest[need..];
+        }
+        assert!(rest.is_empty(), "trial {trial}: trailing bytes {}", rest.len());
+        assert_eq!(entry_hashes.len(), 2, "trial {trial}: expected 2 index entries on disk before revisit: {entry_hashes:?}");
+
         let warm_a = run_shaders_with_cache(dir_a.path(), &["--precompile"], cache_dir.path());
         assert!(warm_a.status.success(), "trial {trial} warm_a: {warm_a:?}");
         let stdout_a = String::from_utf8(warm_a.stdout).unwrap();

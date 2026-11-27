@@ -1727,8 +1727,6 @@ fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
 }
 
 fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     if let Some(dir) = path.parent() {
@@ -1756,13 +1754,9 @@ fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
     std::fs::write(&tmp, &buf)?;
-    let to_wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
-    let tmp_w = to_wide(&tmp);
-    let dst_w = to_wide(path);
-    if unsafe { MoveFileExW(tmp_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) } == 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(err);
+        return Err(e);
     }
     Ok(())
 }
@@ -2641,6 +2635,31 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precompile_index_saves_and_merges_over_long_path() {
+        let root = std::env::temp_dir().join(format!("xcl-idx-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let seg = "a_long_nested_directory_segment_for_path_limit_testing_0123456789";
+        let nested = root.join(seg).join(seg).join(seg).join(seg).join(seg);
+        let idx = nested.join("precompile-index-v1-longpath.bin");
+        assert!(idx.as_os_str().len() > 280, "expected path > 280 chars: {}", idx.as_os_str().len());
+
+        let mut first = HashMap::new();
+        first.insert(0x1010_2020_3030_4040u64, vec![0xABCDu64]);
+        save_precompile_index(&idx, &first).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert(0x5050_6060_7070_8080u64, vec![0xEF01u64]);
+        save_precompile_index(&idx, &second).unwrap();
+
+        let loaded = load_precompile_index(&idx);
+        assert_eq!(loaded.get(&0x1010_2020_3030_4040u64), Some(&vec![0xABCDu64]));
+        assert_eq!(loaded.get(&0x5050_6060_7070_8080u64), Some(&vec![0xEF01u64]));
+        assert_eq!(loaded.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
