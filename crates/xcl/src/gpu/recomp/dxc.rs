@@ -718,6 +718,12 @@ pub fn cache_key_for(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key(src, entry, profile)
 }
 
+/// Validates a single DXIL cache key using the same container check as `cached_file`.
+pub fn validate_cached_key(dir: &Path, key: u64) -> bool {
+    let dir = normalized_cache_dir(dir);
+    cached_file(&dir.join(format!("{key:016x}.dxil"))).is_some()
+}
+
 /// Validates only the DXIL cache keys referenced by a warm precompile index using the
 /// same container check as `cached_file`, leaving unrelated cache entries unread.
 pub fn validated_cache_keys(dir: &Path, candidate_keys: &HashSet<u64>) -> HashSet<u64> {

@@ -507,3 +507,51 @@ fn shaders_precompile_concurrent_processes_preserve_both_index_entries() {
         assert!(stdout_b.contains("compiled 0, already cached 1, errors 0"), "trial {trial} B: {stdout_b}");
     }
 }
+
+#[test]
+fn shaders_precompile_direct_dxil_warm_reports_cached_and_limit_skips_unselected_keys() {
+    /// s_mov_b32 s0, s1 ; v_add_f32 v0, v2, v5 ; s_endpgm
+    const CODE_B: [u8; 12] = [0x01, 0x03, 0x80, 0xbe, 0x02, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+
+    // 1. Direct DXIL graphics warm precompile reports `compiled 0, already cached 1`.
+    let gfx_dir = TempDir::new("precompile-direct-gfx");
+    let gfx_cache = TempDir::new("precompile-direct-gfx-cache");
+    std::fs::write(gfx_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    let cold_direct = run_shaders_with_cache_and_env(
+        gfx_dir.path(),
+        &["--precompile"],
+        gfx_cache.path(),
+        &[("XCL_DIRECT_DXIL", "all")],
+    );
+    assert!(cold_direct.status.success(), "{cold_direct:?}");
+    let cold_direct_stdout = String::from_utf8(cold_direct.stdout).unwrap();
+    assert!(cold_direct_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_direct_stdout}");
+
+    let warm_direct = run_shaders_with_cache_and_env(
+        gfx_dir.path(),
+        &["--precompile"],
+        gfx_cache.path(),
+        &[("XCL_DIRECT_DXIL", "all")],
+    );
+    assert!(warm_direct.status.success(), "{warm_direct:?}");
+    let warm_direct_stdout = String::from_utf8(warm_direct.stdout).unwrap();
+    assert!(warm_direct_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_direct_stdout}");
+
+    // 2. Lazy per-key validation with --limit only checks selected records.
+    //    Replace an unrelated `.dxil` with unreadable directory/invalid state and confirm --limit 1 hits cache cleanly.
+    let limit_dir = TempDir::new("precompile-lazy");
+    let limit_cache = TempDir::new("precompile-lazy-cache");
+    std::fs::write(limit_dir.path().join("00_first.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    std::fs::write(limit_dir.path().join("01_second.bin"), xbox_shader(0, &[fssm(&CODE_B, &[(5, 1)])])).unwrap();
+
+    let cold_all = run_shaders_with_cache(limit_dir.path(), &["--precompile"], limit_cache.path());
+    assert!(cold_all.status.success(), "{cold_all:?}");
+    let cold_all_stdout = String::from_utf8(cold_all.stdout).unwrap();
+    assert!(cold_all_stdout.contains("compiled 2, already cached 0, errors 0"), "{cold_all_stdout}");
+
+    let warm_limit = run_shaders_with_cache(limit_dir.path(), &["--precompile", "--limit", "1"], limit_cache.path());
+    assert!(warm_limit.status.success(), "{warm_limit:?}");
+    let warm_limit_stdout = String::from_utf8(warm_limit.stdout).unwrap();
+    assert!(warm_limit_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_limit_stdout}");
+}

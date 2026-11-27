@@ -1697,11 +1697,8 @@ fn precompile_index_scope(
 
 const PRECOMPILE_INDEX_MAGIC: &[u8; 8] = b"XCLPIDX1";
 
-fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
+fn parse_precompile_index(bytes: &[u8]) -> HashMap<u64, Vec<u64>> {
     let mut out = HashMap::new();
-    let Ok(bytes) = std::fs::read(path) else {
-        return out;
-    };
     let Some(mut rest) = bytes.strip_prefix(PRECOMPILE_INDEX_MAGIC.as_slice()) else {
         return out;
     };
@@ -1726,6 +1723,19 @@ fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
     out
 }
 
+fn try_load_precompile_index(path: &Path) -> std::io::Result<HashMap<u64, Vec<u64>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(parse_precompile_index(&bytes))
+}
+
+fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
+    try_load_precompile_index(path).unwrap_or_default()
+}
+
 fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std::io::Result<()> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1733,7 +1743,7 @@ fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std
         std::fs::create_dir_all(dir)?;
     }
     let _lock = recomp::dxc::lock_cache_file_timeout(path, 250).map_err(std::io::Error::other)?;
-    let mut map = load_precompile_index(path);
+    let mut map = try_load_precompile_index(path)?;
     for (&rec_hash, keys) in additions {
         if !keys.is_empty() && keys.len() <= 256 {
             map.insert(rec_hash, keys.clone());
@@ -1824,11 +1834,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     } else {
         HashMap::new()
     };
-    let existing_dxil = if use_record_index && !initial_index.is_empty() {
-        let referenced: HashSet<u64> = initial_index.values().flatten().copied().collect();
-        recomp::dxc::validated_cache_keys(&cache_dir, &referenced)
+    let dxil_valid: HashMap<u64, std::sync::OnceLock<bool>> = if use_record_index && !initial_index.is_empty() {
+        initial_index
+            .values()
+            .flatten()
+            .copied()
+            .map(|k| (k, std::sync::OnceLock::new()))
+            .collect()
     } else {
-        HashSet::new()
+        HashMap::new()
     };
     let index_state: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(HashMap::new());
     let dirty_index = AtomicUsize::new(0);
@@ -1863,7 +1877,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 };
                 let rec_hash = use_record_index.then(|| shader::fnv64(&blob));
                 if let Some(keys) = rec_hash.and_then(|h| initial_index.get(&h)) {
-                    if !keys.is_empty() && keys.iter().all(|k| existing_dxil.contains(k)) {
+                    if !keys.is_empty()
+                        && keys.iter().all(|k| {
+                            dxil_valid
+                                .get(k)
+                                .is_some_and(|cell| *cell.get_or_init(|| recomp::dxc::validate_cached_key(&cache_dir, *k)))
+                        })
+                    {
                         cached.fetch_add(keys.len(), Ordering::Relaxed);
                         record_done();
                         continue;
@@ -1888,22 +1908,26 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         record_done();
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match recomp::pso::console_to_dxil_in_status(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok((c, from_cache)) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
                                 if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
                                     p.make_one(&c.dxil, &c.samplers, true, None);
                                 }
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if from_cache {
+                                cached.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                compiled.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
                             }
-                            failed.fetch_add(1, Ordering::Relaxed)
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
                     };
                     record_done();
@@ -1920,9 +1944,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             recomp::pso::Stage::Pixel
                         };
                         record_indexable = false;
-                        match recomp::pso::console_to_dxil_in(&blob, stage, 0, graphics_split, windows) {
-                            Ok(_) => {
-                                compiled.fetch_add(1, Ordering::Relaxed);
+                        match recomp::pso::console_to_dxil_in_status(&blob, stage, 0, graphics_split, windows) {
+                            Ok((_, from_cache)) => {
+                                if from_cache {
+                                    cached.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    compiled.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             Err(e) if e.contains("incomplete translation") => {
                                 if startup.is_some() {
@@ -2660,6 +2688,47 @@ mod tests {
         assert_eq!(loaded.len(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_precompile_index_preserves_existing_file_on_read_error() {
+        let dir = std::env::temp_dir().join(format!("xcl-idx-readerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. A path that exists as a directory (NotFound == false) returns Err instead of treating it as empty.
+        let dir_as_index = dir.join("dir_index.bin");
+        std::fs::create_dir_all(&dir_as_index).unwrap();
+        let mut add = HashMap::new();
+        add.insert(0xDEAD_BEEFu64, vec![0x1234u64]);
+        let err = save_precompile_index(&dir_as_index, &add).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(dir_as_index.is_dir());
+
+        // 2. An existing readable index later held with share_mode(0) must return Err and remain intact.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let idx = dir.join("locked_index.bin");
+            let mut initial = HashMap::new();
+            initial.insert(0x1111_2222_3333_4444u64, vec![0xAAAAu64]);
+            save_precompile_index(&idx, &initial).unwrap();
+
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&idx)
+                .unwrap();
+            let err = save_precompile_index(&idx, &add).unwrap_err();
+            assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+            drop(locked);
+
+            let after = load_precompile_index(&idx);
+            assert_eq!(after, initial);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
