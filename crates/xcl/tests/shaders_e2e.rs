@@ -63,17 +63,30 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 fn run_shaders_with_cache(target: &Path, extra: &[&str], cache_dir: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_xcl"))
-        .arg("shaders")
+    run_shaders_with_cache_and_env(target, extra, cache_dir, &[])
+}
+
+fn run_shaders_with_cache_and_env(
+    target: &Path,
+    extra: &[&str],
+    cache_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcl"));
+    cmd.arg("shaders")
         .arg(target)
         .args(extra)
         .env("XCL_DXIL_CACHE", cache_dir)
         .env_remove("XCL_DIRECT_DXIL")
+        .env_remove("XCL_SAFE_BARRIER")
+        .env_remove("XCL_RECOMP_NO_STRUCTURED")
         .env_remove("XCL_DUMP_HLSL")
         .env_remove("XCL_RECOMP_ONLY")
-        .env_remove("XCL_EXAMPLE_HLSL")
-        .output()
-        .expect("spawn xcl shaders")
+        .env_remove("XCL_EXAMPLE_HLSL");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn xcl shaders")
 }
 
 #[test]
@@ -348,4 +361,76 @@ fn shaders_precompile_recovers_corrupt_same_length_cached_dxil() {
     let recovered_stdout = String::from_utf8(recovered.stdout).unwrap();
     assert!(recovered_stdout.contains("compiled 1, already cached 0, errors 0"), "{recovered_stdout}");
     assert_eq!(std::fs::read(&dxil_path).unwrap(), orig_bytes);
+}
+
+#[test]
+fn shaders_precompile_scopes_safe_barrier_and_bypasses_diagnostic_overrides() {
+    let shader_dir = TempDir::new("precompile-scope");
+    let cache_dir = TempDir::new("precompile-scope-cache");
+    std::fs::write(shader_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    let count_indices = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with("precompile-index-v1-") && s.ends_with(".bin")
+            })
+            .count()
+    };
+
+    // 1. Default (XCL_SAFE_BARRIER unset) -> 1 index, then XCL_SAFE_BARRIER=1 / " 1 " hit the same scope.
+    let cold = run_shaders_with_cache_and_env(shader_dir.path(), &["--precompile"], cache_dir.path(), &[]);
+    assert!(cold.status.success(), "{cold:?}");
+    let cold_stdout = String::from_utf8(cold.stdout).unwrap();
+    assert!(cold_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 1);
+
+    for val in ["1", " 1 "] {
+        let warm = run_shaders_with_cache_and_env(
+            shader_dir.path(),
+            &["--precompile"],
+            cache_dir.path(),
+            &[("XCL_SAFE_BARRIER", val)],
+        );
+        assert!(warm.status.success(), "{warm:?}");
+        let warm_stdout = String::from_utf8(warm.stdout).unwrap();
+        assert!(warm_stdout.contains("compiled 0, already cached 1, errors 0"), "{val:?}: {warm_stdout}");
+        assert_eq!(count_indices(cache_dir.path()), 1);
+    }
+
+    // 2. XCL_SAFE_BARRIER=0 uses a separate scope; whitespace-padded " 0 " hits that same scope.
+    let sb0 = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_SAFE_BARRIER", "0")],
+    );
+    assert!(sb0.status.success(), "{sb0:?}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
+
+    let sb0_pad = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_SAFE_BARRIER", " 0 ")],
+    );
+    assert!(sb0_pad.status.success(), "{sb0_pad:?}");
+    let sb0_pad_stdout = String::from_utf8(sb0_pad.stdout).unwrap();
+    assert!(sb0_pad_stdout.contains("compiled 0, already cached 1, errors 0"), "{sb0_pad_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
+
+    // 3. Diagnostic recomp overrides disable the warm record index cleanly.
+    let diag = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_RECOMP_NO_STRUCTURED", "1")],
+    );
+    assert!(diag.status.success(), "{diag:?}");
+    let diag_stdout = String::from_utf8(diag.stdout).unwrap();
+    assert!(diag_stdout.contains("errors 0"), "{diag_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
 }

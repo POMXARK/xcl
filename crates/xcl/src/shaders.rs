@@ -1652,11 +1652,23 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
-fn precompile_index_scope(windows: u32, split: bool, graphics_split: bool, direct_gfx: bool) -> u64 {
+fn safe_barrier_enabled(raw: Option<&str>) -> bool {
+    raw.map_or(true, |v| v.trim() != "0")
+}
+
+fn precompile_index_scope_with(
+    translator_source_id: &str,
+    windows: u32,
+    split: bool,
+    graphics_split: bool,
+    direct_gfx: bool,
+    safe_barrier: bool,
+) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let tag = format!(
-        "{}:{}:{windows}:{split}:{graphics_split}:{direct_gfx}",
+        "{}:{}:{}:{windows}:{split}:{graphics_split}:{direct_gfx}:{safe_barrier}",
         env!("CARGO_PKG_VERSION"),
+        translator_source_id,
         recomp::dxc::toolchain_identity()
     );
     for b in tag.bytes() {
@@ -1664,6 +1676,23 @@ fn precompile_index_scope(windows: u32, split: bool, graphics_split: bool, direc
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+fn precompile_index_scope(
+    windows: u32,
+    split: bool,
+    graphics_split: bool,
+    direct_gfx: bool,
+    safe_barrier: bool,
+) -> u64 {
+    precompile_index_scope_with(
+        env!("XCL_TRANSLATOR_SOURCE_ID"),
+        windows,
+        split,
+        graphics_split,
+        direct_gfx,
+        safe_barrier,
+    )
 }
 
 const PRECOMPILE_INDEX_MAGIC: &[u8; 8] = b"XCLPIDX1";
@@ -1777,10 +1806,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
     let direct_gfx = crate::gpu::dxil::kernel::enabled_graphics();
     let cache_dir = recomp::dxc::cache_dir();
-    let use_record_index = only.is_none();
+    let use_record_index = only.is_none() && recomp::pso::precompile_index_allowed();
+    let safe_barrier = safe_barrier_enabled(std::env::var("XCL_SAFE_BARRIER").ok().as_deref());
     let index_path = cache_dir.join(format!(
         "precompile-index-v1-{:016x}.bin",
-        precompile_index_scope(windows, split, graphics_split, direct_gfx)
+        precompile_index_scope(windows, split, graphics_split, direct_gfx, safe_barrier)
     ));
     let initial_index = if use_record_index {
         load_precompile_index(&index_path)
@@ -2550,11 +2580,43 @@ mod tests {
         std::fs::write(&idx, raw).unwrap();
         assert_eq!(load_precompile_index(&idx), map);
 
-        // Scope hash changes cleanly when direct_gfx toggles
+        // Scope hash changes cleanly when translator source, direct_gfx, or safe_barrier toggles
         assert_ne!(
-            precompile_index_scope(4, true, true, false),
-            precompile_index_scope(4, true, true, true)
+            precompile_index_scope(4, true, true, false, true),
+            precompile_index_scope(4, true, true, true, true)
         );
+        assert_ne!(
+            precompile_index_scope(4, true, true, false, true),
+            precompile_index_scope(4, true, true, false, false)
+        );
+        assert_ne!(
+            precompile_index_scope_with("rev-a", 4, true, true, false, true),
+            precompile_index_scope_with("rev-b", 4, true, true, false, true)
+        );
+
+        assert!(safe_barrier_enabled(None));
+        assert!(safe_barrier_enabled(Some("1")));
+        assert!(safe_barrier_enabled(Some(" 1 ")));
+        assert!(!safe_barrier_enabled(Some("0")));
+        assert!(!safe_barrier_enabled(Some(" 0 ")));
+
+        assert!(recomp::pso::precompile_index_allowed_with(|_| false));
+        for var in [
+            "XCL_RECOMP_NO_STRUCTURED",
+            "XCL_RECOMP_WHY",
+            "XCL_X64_ALL_MASKS",
+            "XCL_WAVE64_SPIN",
+            "XCL_DXIL_NO_OPT",
+            "XCL_DEBUG_MAGENTA",
+            "XCL_DEBUG_LOD0",
+            "XCL_DEBUG_PS_SUB",
+            "XCL_DEBUG_PS_EXPR",
+        ] {
+            assert!(
+                !recomp::pso::precompile_index_allowed_with(|name| name == var),
+                "expected {var} to disable warm precompile index"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -919,6 +919,14 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+pub(crate) fn precompile_index_allowed_with(present: impl Fn(&str) -> bool) -> bool {
+    cache_allowed(Stage::Pixel, present)
+}
+
+pub(crate) fn precompile_index_allowed() -> bool {
+    precompile_index_allowed_with(|name| std::env::var_os(name).is_some())
+}
+
 /// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
