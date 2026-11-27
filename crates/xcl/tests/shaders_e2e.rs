@@ -62,6 +62,20 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
         .expect("spawn xcl shaders")
 }
 
+fn run_shaders_with_cache(target: &Path, extra: &[&str], cache_dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .arg(target)
+        .args(extra)
+        .env("XCL_DXIL_CACHE", cache_dir)
+        .env_remove("XCL_DIRECT_DXIL")
+        .env_remove("XCL_DUMP_HLSL")
+        .env_remove("XCL_RECOMP_ONLY")
+        .env_remove("XCL_EXAMPLE_HLSL")
+        .output()
+        .expect("spawn xcl shaders")
+}
+
 #[test]
 fn help_lists_shader_precompile_options() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
@@ -289,4 +303,49 @@ fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
         assert!(stderr.contains(expected_msg), "args {args:?}: expected {expected_msg:?} in {stderr:?}");
         assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
     }
+}
+
+#[test]
+fn shaders_precompile_recovers_corrupt_same_length_cached_dxil() {
+    let shader_dir = TempDir::new("precompile-corrupt");
+    let cache_dir = TempDir::new("precompile-corrupt-cache");
+    std::fs::write(shader_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    // 1. Cold precompile writes the cached DXIL container and warm index.
+    let cold = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(cold.status.success(), "{cold:?}");
+    let cold_stdout = String::from_utf8(cold.stdout).unwrap();
+    assert!(cold_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_stdout}");
+
+    let mut dxil_files = Vec::new();
+    let mut index_files = Vec::new();
+    for entry in std::fs::read_dir(cache_dir.path()).unwrap().flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.ends_with(".dxil") {
+            dxil_files.push(entry.path());
+        } else if s.starts_with("precompile-index-v1-") && s.ends_with(".bin") {
+            index_files.push(entry.path());
+        }
+    }
+    assert_eq!(dxil_files.len(), 1, "expected 1 .dxil file: {dxil_files:?}");
+    assert_eq!(index_files.len(), 1, "expected 1 precompile index file: {index_files:?}");
+    let dxil_path = dxil_files.pop().unwrap();
+    let orig_bytes = std::fs::read(&dxil_path).unwrap();
+    assert!(orig_bytes.starts_with(b"DXBC"), "unexpected DXIL header");
+
+    // 2. Warm valid run hits the index without recompiling.
+    let warm = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(warm.status.success(), "{warm:?}");
+    let warm_stdout = String::from_utf8(warm.stdout).unwrap();
+    assert!(warm_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_stdout}");
+    assert_eq!(std::fs::read(&dxil_path).unwrap(), orig_bytes);
+
+    // 3. Overwriting the cached DXIL with same-length zeros must be caught and restored.
+    std::fs::write(&dxil_path, vec![0u8; orig_bytes.len()]).unwrap();
+    let recovered = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(recovered.status.success(), "{recovered:?}");
+    let recovered_stdout = String::from_utf8(recovered.stdout).unwrap();
+    assert!(recovered_stdout.contains("compiled 1, already cached 0, errors 0"), "{recovered_stdout}");
+    assert_eq!(std::fs::read(&dxil_path).unwrap(), orig_bytes);
 }

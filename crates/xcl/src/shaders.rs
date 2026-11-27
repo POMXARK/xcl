@@ -1778,11 +1778,6 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let direct_gfx = crate::gpu::dxil::kernel::enabled_graphics();
     let cache_dir = recomp::dxc::cache_dir();
     let use_record_index = only.is_none();
-    let existing_dxil = if use_record_index {
-        recomp::dxc::existing_cache_keys(&cache_dir)
-    } else {
-        HashSet::new()
-    };
     let index_path = cache_dir.join(format!(
         "precompile-index-v1-{:016x}.bin",
         precompile_index_scope(windows, split, graphics_split, direct_gfx)
@@ -1791,6 +1786,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         load_precompile_index(&index_path)
     } else {
         HashMap::new()
+    };
+    let existing_dxil = if use_record_index && !initial_index.is_empty() {
+        let referenced: HashSet<u64> = initial_index.values().flatten().copied().collect();
+        recomp::dxc::validated_cache_keys(&cache_dir, &referenced)
+    } else {
+        HashSet::new()
     };
     let index_state: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(initial_index.clone());
     let dirty_index = AtomicUsize::new(0);

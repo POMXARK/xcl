@@ -718,38 +718,18 @@ pub fn cache_key_for(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key(src, entry, profile)
 }
 
-/// Scans `dir` once and returns all valid `<16-hex>.dxil` cache keys present on disk.
-pub fn existing_cache_keys(dir: &Path) -> HashSet<u64> {
-    let mut keys = HashSet::new();
-    let dir = normalized_cache_dir(dir);
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return keys;
-    };
-    for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(s) = name.to_str() else {
-            continue;
-        };
-        let Some(hex) = s.strip_suffix(".dxil") else {
-            continue;
-        };
-        if hex.len() != 16 {
-            continue;
-        }
-        let Ok(key) = u64::from_str_radix(hex, 16) else {
-            continue;
-        };
-        if entry.metadata().is_ok_and(|m| m.len() >= 36) {
-            keys.insert(key);
-        }
+/// Validates only the DXIL cache keys referenced by a warm precompile index using the
+/// same container check as `cached_file`, leaving unrelated cache entries unread.
+pub fn validated_cache_keys(dir: &Path, candidate_keys: &HashSet<u64>) -> HashSet<u64> {
+    if candidate_keys.is_empty() {
+        return HashSet::new();
     }
-    keys
+    let dir = normalized_cache_dir(dir);
+    candidate_keys
+        .iter()
+        .copied()
+        .filter(|key| cached_file(&dir.join(format!("{key:016x}.dxil"))).is_some())
+        .collect()
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -1584,23 +1564,34 @@ mod cache_tests {
     }
 
     #[test]
-    fn existing_cache_keys_and_memory_reserve_swap_behave_cleanly() {
+    fn validated_cache_keys_and_memory_reserve_swap_behave_cleanly() {
         let prev = set_memory_reserve(3);
         assert_eq!(set_memory_reserve(prev), 3);
 
         let dir = std::env::temp_dir().join(format!("xcl-dxil-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let k1 = cache_key("first shader", "main", "cs_6_6");
-        let k2 = cache_key("second shader", "main", "ps_6_6");
-        std::fs::write(dir.join(format!("{k1:016x}.dxil")), synthetic_dxil(1)).unwrap();
-        std::fs::write(dir.join(format!("{k2:016x}.dxil")), b"tiny").unwrap();
-        std::fs::write(dir.join("nothex0000000000.dxil"), synthetic_dxil(2)).unwrap();
-        std::fs::write(dir.join(format!("{k1:016x}.err")), b"XCLDXCE1").unwrap();
+        let valid_blob = synthetic_dxil(1);
+        let k_valid = cache_key("first shader", "main", "cs_6_6");
+        let k_zeroed = cache_key("corrupt zeroed shader", "main", "ps_6_6");
+        let k_short = cache_key("truncated shader", "main", "ps_6_6");
+        let k_missing = cache_key("missing shader", "main", "vs_6_6");
+        let k_unrelated = cache_key("unrelated cached shader", "main", "ps_6_6");
 
-        let keys = existing_cache_keys(&dir);
-        assert!(keys.contains(&k1));
-        assert!(!keys.contains(&k2));
+        std::fs::write(dir.join(format!("{k_valid:016x}.dxil")), &valid_blob).unwrap();
+        std::fs::write(dir.join(format!("{k_zeroed:016x}.dxil")), vec![0u8; valid_blob.len()]).unwrap();
+        std::fs::write(dir.join(format!("{k_short:016x}.dxil")), b"tiny").unwrap();
+        std::fs::write(dir.join(format!("{k_unrelated:016x}.dxil")), synthetic_dxil(2)).unwrap();
+        std::fs::write(dir.join("nothex0000000000.dxil"), synthetic_dxil(3)).unwrap();
+        std::fs::write(dir.join(format!("{k_valid:016x}.err")), b"XCLDXCE1").unwrap();
+
+        let candidates = HashSet::from([k_valid, k_zeroed, k_short, k_missing]);
+        let keys = validated_cache_keys(&dir, &candidates);
+        assert!(keys.contains(&k_valid));
+        assert!(!keys.contains(&k_zeroed));
+        assert!(!keys.contains(&k_short));
+        assert!(!keys.contains(&k_missing));
+        assert!(!keys.contains(&k_unrelated));
         assert_eq!(keys.len(), 1);
         assert_eq!(normalized_cache_dir(&dir), normalized_cache_dir(&dir));
 
